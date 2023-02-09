@@ -1,5 +1,5 @@
 import time, torch, functools, utils, math, sys, random
-sys.path.insert(1, '/Users/joshuha.thomas-wilsker/Documents/work/machine_learning/score_based_models/calo_challenge/code')
+sys.path.insert(1, '/afs/cern.ch/work/j/jthomasw/private/NTU/fast_sim/calochall_homepage/code')
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
@@ -203,7 +203,7 @@ def loss_fn(model, x, energy_, epoch, marginal_prob_std, eps=1e-5):
     score = model(perturbed_x, random_t, energy_)
 
     # Evaluate the loss
-    loss = torch.mean( torch.sum( (score * std[:, None, None] + z)**2, dim=(1,2,3) ) )
+    loss = torch.mean( torch.sum( (score * std[:, None, None] + z)**2, dim=(1,2) ) )
     return loss
 
 def pc_sampler(score_model, marginal_prob_std, diffusion_coeff, sampled_energies, batch_size=64, snr=0.16, device='cuda', eps=1e-3):
@@ -235,6 +235,7 @@ def pc_sampler(score_model, marginal_prob_std, diffusion_coeff, sampled_energies
             #sampled_energies.to(device)
             # Sneaky bug fix (matrix multiplication in GaussianFourier projection doesnt like float64s)
             sampled_energies = sampled_energies.to(torch.float32)
+            sampled_energies.to(device)
             
             # Corrector step (Langevin MCMC)
             # First calculate Langevin step size
@@ -255,9 +256,17 @@ def pc_sampler(score_model, marginal_prob_std, diffusion_coeff, sampled_energies
     return x_mean
 
 def main():
+    print('torch version: ', torch.__version__)
     global device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    filename = '../datasets/dataset_1_photons_1.hdf5'
+    print('Running on device: ', device)
+    if torch.cuda.is_available():
+        print('Cuda used to build pyTorch: ',torch.version.cuda)
+        print('Current device: ', torch.cuda.current_device())
+        print('cuda arch list: ', torch.cuda.get_arch_list())
+    
+    
+    filename = '/afs/cern.ch/work/j/jthomasw/private/NTU/fast_sim/calochall_homepage/datasets/dataset_1_photons_1.hdf5'
 
     sigma = 25.0
     marginal_prob_std_fn = functools.partial(marginal_prob_std, sigma=sigma)
@@ -265,14 +274,14 @@ def main():
     n_epochs = 20
     batch_size = 100
     lr = 1e-4
-    training_switch = 0
+    training_switch = 1
     sampling_switch = 1
 
     # load .hdf5 dataset
     train_ds = utils.custom_dataset(filename,'train', 0.5)
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=False)
     
-    HLF_1_photons = HLF('photon', filename='../code/binning_dataset_1_photons.xml')
+    HLF_1_photons = HLF('photon', filename='/afs/cern.ch/work/j/jthomasw/private/NTU/fast_sim/calochall_homepage/code/binning_dataset_1_photons.xml')
     HLF_1_photons.CalculateFeatures(train_ds.showers_[:])
     for energy in [256., 1024., 1048576.]:
         savename = 'training_showers_'+str(energy)+'.png'

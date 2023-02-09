@@ -1,10 +1,56 @@
-### Time derivative score-based model notes
-
+<!--### Time derivative score-based model notes-->
+<!-- ![img](Banner_grey.jpg) -->
 # Setup
+## Conda
 Used conda pacakage installation and management tool to create new environment 'tdsbmodel' holding all required packages
 conda activate tdsbmodel
 
-# Pytorch modules
+## Python Virtual Environment
+*On lxplus* you will need to do this via a virtualenv. However, in order to run using the GPUs, you will need a 
+pytorch version with sm_80 cuda capabilities. This in itself requires a pytorch version that is >=1.7.0. 
+Strangely, I was unable to get this for v1.10.1 and with python 3.6 it was impossible to install a later version 
+due to the pip wheel available for this python version(?). Using the following commands I updated to python 3.8 
+on lxplus:
+```
+scl enable rh-python38 bash
+python -V
+```
+which enabled me to setup a venv for python 3.8:
+```
+python -m venv virtualenvpy3p8
+```
+update pip
+```
+pip install --upgrade pip
+```
+and install the latest stable pytorch version:
+```
+pip install torch
+```
+Now the command 
+```
+torch.cuda.get_arch_list()
+```
+when run on a machine with GPU capability, should return a list that includes sm_80.
+
+# Condor
+## Running Jobs on Condor
+Note the condor scripts available in the condor_scripts directory allow one to submit jobs to run on CERNs lxplus farm remotely. By default, the job will get one slot of a CPU core with 2GB of memory and 20GB of disk space. You can ask for more CPUs and/or memory but the system will scale thje number of CPUs you receive to respect the 2GB per core limit.
+
+To ask for more CPUs, alter N in the following command in the submission script:
+```
+request_CPUs = N
+```
+One can request GPU functionality using:
+```
+request_GPUs = 2
+```
+
+# Datasets
+Taking datasets from calochallenge atm. See calochallenge page for where to download datasets from.
+
+# Useful/interesting Pytorch Info
+## Modules
 Pytorch uses modules to represent neural networks. Pytorch provides a robust library of modules and makes it simple to define new ones.
 All NN modules should:
 - Inherit from the base module class nn.Module.
@@ -106,3 +152,9 @@ p_0(x) = p_T(h(x)) | det(J_h(x)) |
 ```
 where J_h(x) represents the Jacobian of the mapping h
 
+
+# Transformer models
+How you order the dimensions of the input is important when passing to the transformer / attention mechanism. In the pytorch attention mechanism, the code is expecting the input dimensionality to match:
+```
+[# batches, # points, # features]
+```
