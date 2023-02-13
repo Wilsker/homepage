@@ -1,6 +1,6 @@
 import time, functools, utils, math, sys, random
 import torch#, torch_geometric
-sys.path.insert(1, '/afs/cern.ch/work/j/jthomasw/private/NTU/fast_sim/calochall_homepage/code')
+sys.path.insert(1, '../code')
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
@@ -37,11 +37,13 @@ class Block(nn.Module):
         x_cls = self.act_dropout(x_cls)
         x_cls = self.fc2(x_cls)
 
-        x = x + x_cls
+        #x = x + x_cls
+        x += x_cls
         x = self.act(self.fc1(x))
         x = self.act_dropout(x)
         x = self.fc2(x)
-        x = x + residual
+        #x = x + residual
+        x += residual
         return x
 
 
@@ -70,11 +72,12 @@ class Gen(nn.Module):
 
     def forward(self,x,mask=None):
         x = self.embbed(x)
-
         # 'class' token (mean field)
         x_cls = self.cls_token.expand(x.size(0), 1, -1)
-
+        
+        # Encoder block
         for layer in self.encoder:
+            #print('layer: ', layer)
             x = layer(x, x_cls=x_cls, src_key_padding_mask=mask)
 
         return self.out(x)
@@ -93,8 +96,9 @@ def marginal_prob_std(t, sigma):
     Returns:
         The standard deviation.
     """    
-    t = torch.tensor(t, device=device)
-    return torch.sqrt((sigma**(2 * t) - 1.) / 2. / np.log(sigma))
+    t = t.clone().detach() #torch.tensor(t, device=device)
+    std = torch.sqrt((sigma**(2 * t) - 1.) / 2. / np.log(sigma)) 
+    return std
 
 def loss_fn(model, x, marginal_prob_std , eps=1e-5):
     """The loss function for training score-based generative models
@@ -131,7 +135,7 @@ def main():
     sigma = 25.0
     marginal_prob_std_fn = functools.partial(marginal_prob_std, sigma=sigma)
     
-    filename = '/eos/user/t/tihsu/SWAN_projects/homepage/datasets/graph/dataset_1_photons_1_graph_0.pt'
+    filename = '/Users/joshuha.thomas-wilsker/Documents/work/projects/machine_learning/score_based_models/calo_challenge/datasets/dataset_1_photons_1_graph_0.pt'
     loaded_file = torch.load(filename)
     point_clouds = loaded_file[0]
     print(f'Loading {len(point_clouds)} point clouds from file {filename}')
