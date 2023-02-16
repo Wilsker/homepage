@@ -1,16 +1,12 @@
-import time, functools, utils, math, sys, random
-import torch#, torch_geometric
-sys.path.insert(1, '../code')
+import time, functools, torch, os
+from datetime import datetime
+import numpy as np
+import matplotlib.pyplot as plt
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
 import torchvision.transforms as transforms
-#from torch.utils.data import DataLoader
 from torch_geometric.loader import DataLoader
-import numpy as np
-import matplotlib.pyplot as plt
-from HighLevelFeatures import HighLevelFeatures as HLF
-
 
 class Block(nn.Module):
     def __init__(self, embed_dim, num_heads, hidden, dropout):
@@ -18,9 +14,7 @@ class Block(nn.Module):
 
         # batch_first=True because normally in NLP the batch dimension would be the second dimension
         # In everything(?) else it is the first dimension so this flag is set to true to match other conventions
-        self.attn = nn.MultiheadAttention(
-            embed_dim, num_heads, batch_first=True, dropout=0
-        )
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=0)
         self.dropout = nn.Dropout(dropout)
         self.fc1 = nn.Linear(embed_dim, hidden)
         self.fc2 = nn.Linear(hidden, embed_dim)
@@ -37,13 +31,11 @@ class Block(nn.Module):
         x_cls = self.act_dropout(x_cls)
         x_cls = self.fc2(x_cls)
 
-        #x = x + x_cls
-        x += x_cls
+        x = x + x_cls.clone()
         x = self.act(self.fc1(x))
         x = self.act_dropout(x)
         x = self.fc2(x)
-        #x = x + residual
-        x += residual
+        x = x + residual
         return x
 
 
@@ -53,7 +45,7 @@ class Gen(nn.Module):
         # Embedding layer increases dimensionality:
         #   size of input (n_dim) features -> size of output (l_dim_gen)
         self.embbed = nn.Linear(n_dim, l_dim_gen)
-        # Encoder is a series of 'Blocks'
+        # Module list of encoder blocks
         self.encoder = nn.ModuleList(
             [
                 Block(
@@ -77,7 +69,6 @@ class Gen(nn.Module):
         
         # Encoder block
         for layer in self.encoder:
-            #print('layer: ', layer)
             x = layer(x, x_cls=x_cls, src_key_padding_mask=mask)
 
         return self.out(x)
@@ -123,6 +114,9 @@ def loss_fn(model, x, marginal_prob_std , eps=1e-5):
     return cloud_loss
 
 def main():
+    # For debugging gradient issues
+    #torch.autograd.set_detect_anomaly(True)
+
     print('torch version: ', torch.__version__)
     global device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -135,72 +129,92 @@ def main():
     sigma = 25.0
     marginal_prob_std_fn = functools.partial(marginal_prob_std, sigma=sigma)
     
-    filename = '/Users/joshuha.thomas-wilsker/Documents/work/projects/machine_learning/score_based_models/calo_challenge/datasets/dataset_1_photons_1_graph_0.pt'
+    filename = '/eos/user/t/tihsu/SWAN_projects/homepage/datasets/dataset_1_photons_1_graph.pt'
     loaded_file = torch.load(filename)
     point_clouds = loaded_file[0]
     print(f'Loading {len(point_clouds)} point clouds from file {filename}')
     energies = loaded_file[1]
-    nclouds = 1
-    batch_size = 5
+    load_n_clouds = 1
     lr = 1e-4
-    n_epochs = 5
+    n_epochs = 20
+    av_losses_per_epoch = []
+
+    output_directory = '/afs/cern.ch/work/j/jthomasw/private/NTU/fast_sim/calochall_homepage/scoremodel/training_'+datetime.now().strftime('%Y%m%d_%H%M')+'_output/'
+    if not os.path.exists(output_directory):
+        os.makedirs(output_directory)
+
     
     # Size of the last dimension of the input must match the input to the embedding layer
     # First arg = number of features
     model=Gen(4,20,128,3,1,0)
     #for para_ in model.parameters():
     #    print('model parameters: ', para_)
+
     optimiser = Adam(model.parameters(),lr=lr)
     cumulative_epoch_loss = 0.
     cumulative_num_clouds = 0
-    # Load all clouds in data
-    point_clouds_loader = DataLoader(point_clouds,batch_size=nclouds,shuffle=False)
-    cloud_iter_ = iter(point_clouds_loader)
+    # Load clouds for each epoch of data
+    point_clouds_loader = DataLoader(point_clouds,batch_size=load_n_clouds,shuffle=False)
+    #cloud_iter_ = iter(point_clouds_loader)
+    batch_size = 5
     for epoch in range(0,n_epochs):
         print(f"epoch: {epoch}")
+        cloud_batch_losses = []
         
-        batch_losses = []
-
-
-        # Batch loop
-        for i in range(0, len(point_clouds), batch_size):
-            print(f"Batch: {i}")
-
-            if cumulative_num_clouds+batch_size > len(point_clouds):
-                batch_size = len(point_clouds)-cumulative_num_clouds
+        # Load clouds one at a time
+        #for i in range(0, len(point_clouds), load_n_clouds):
+        #for i in range(0, n_clouds_in_batch, load_n_clouds):
+        for i, cloud_data in enumerate(point_clouds_loader,0):
+            if i%100 == 0: print(f"Batch: {i}")
+            #print(f"Batch: {i}")
             
-            # Loop over clouds in batch
-            for cloud_ in range(0,batch_size):
-                print(f'cloud_: {cloud_}')
-                cloud_data = next(cloud_iter_)
-                input_data = torch.unsqueeze(cloud_data.x, 0)
-                # Calculate loss for cloud
-                cloud_loss = loss_fn(model, input_data, marginal_prob_std_fn)
-                batch_losses.append( cloud_loss )
+            #cloud_data = next(cloud_iter_)
+            if len(cloud_data.x) < 1:
+                print('Very few points in cloud: ', cloud_data.x)
+                continue
+            input_data = torch.unsqueeze(cloud_data.x, 0)
+            cloud_loss = loss_fn(model, input_data, marginal_prob_std_fn)
+            print(f'cloud_loss: {cloud_loss} \n {cloud_loss.item()}')
             
-            # Get mean of per cloud losses for batch loss
-            batch_loss_tensor = torch.cat(batch_losses)
-            batch_mean_loss = torch.mean(batch_loss_tensor)
+            # collect losses of each cloud in batch
+            cloud_batch_losses.append( cloud_loss )
+            #cloud_batch_loss += cloud_loss
+            if i%batch_size == 0 and i>0:
+                print(f'cloud_batch_losses: {cloud_batch_losses}')
+                cloud_batch_loss = sum(cloud_batch_losses)
+                optimiser.zero_grad()
+                cloud_batch_loss.backward(retain_graph=True)
+                optimiser.step()
             
             # Zero any gradients from previous steps
-            optimiser.zero_grad()
+            #optimiser.zero_grad()
 
             # collect dL/dx for any parameters (x) which have requires_grad = True via: x.grad += dL/dx
-            batch_mean_loss.backward(retain_graph=True)
+            #cloud_loss.backward(retain_graph=True)
 
             # Update value of x += -lr * x.grad
-            optimiser.step()
+            #optimiser.step()
 
             # add the batch mean loss * size of batch to cumulative loss
-            cumulative_epoch_loss+=batch_mean_loss.item()*batch_size
+            #cumulative_epoch_loss+=cloud_loss.item()*load_n_clouds
 
             # add the batch size just used to the total number of clouds
-            cumulative_num_clouds+=batch_size
+            #cumulative_num_clouds = i
 
-        print(f'Sanity check: {cumulative_num_clouds}, {len(point_clouds)}')
-        print(f'Average Loss for the epoch: {(cumulative_epoch_loss/cumulative_num_clouds):.3f}')
+        
+        #av_losses_per_epoch.append(cumulative_epoch_loss/cumulative_num_clouds)
+        #print(f'Average Loss for the epoch: {(cumulative_epoch_loss/cumulative_num_clouds):.3f}')
         # Save checkpoint file after each epoch
-        torch.save(model.state_dict(), 'ckpt_tmp.pth')
+        torch.save(model.state_dict(), output_directory+'ckpt_tmp.pth')
+
+    fig, ax = plt.subplots(ncols=1, figsize=(10,10))
+    plt.title('')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend(loc='upper right')
+    plt.plot(av_losses_per_epoch, label='training')
+    plt.tight_layout()
+    fig.savefig(output_directory+'loss_v_epoch.png')
 
 
 if __name__=='__main__':
