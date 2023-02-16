@@ -156,7 +156,7 @@ def main():
     # Load clouds for each epoch of data
     point_clouds_loader = DataLoader(point_clouds,batch_size=load_n_clouds,shuffle=False)
     #cloud_iter_ = iter(point_clouds_loader)
-    batch_size = 5
+    batch_size = 50
     for epoch in range(0,n_epochs):
         print(f"epoch: {epoch}")
         cloud_batch_losses = []
@@ -185,6 +185,7 @@ def main():
                 optimiser.zero_grad()
                 cloud_batch_loss.backward(retain_graph=True)
                 optimiser.step()
+                cloud_batch_losses.clear()
             
             # Zero any gradients from previous steps
             #optimiser.zero_grad()
