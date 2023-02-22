@@ -42,6 +42,7 @@ if __name__=='__main__':
   usage = 'usage: %prog [options]'
   parser = argparse.ArgumentParser(description=usage)
   parser.add_argument('-d', '--dataset', dest='dataset', help='dataset[1/2/3]',default=1, type=int)
+  parser.add_argument("--coordinate", dest='coordinate', help='[polar/euclidian]', default='polar', type='string')
   parser.add_argument("--test", action="store_true")
   parser.add_argument('--store_geometric', dest = 'store_geometric', action = "store_true")
   parser.add_argument("--merge", action="store_true")
@@ -93,12 +94,12 @@ if __name__=='__main__':
       for batch in range(((nEntries//batchsize) + 1)):
         command  = "source /cvmfs/sft.cern.ch/lcg/views/LCG_102b_cuda/x86_64-centos7-gcc8-opt/setup.sh\n"
         if args.store_geometric:
-          command += "python GraphCreator.py --particle %s --xml %s --dataset %s --from %d --to %d --tag %d --store_geometric\n"%(task["particle"], task["xml"], os.path.join(dataset_directory, data), batchsize*batch, min(batchsize*(batch+1),nEntries), batch)
+          command += "python GraphCreator.py --particle %s --xml %s --dataset %s --from %d --to %d --tag %d --store_geometric --coordinate %s\n"%(task["particle"], task["xml"], os.path.join(dataset_directory, data), batchsize*batch, min(batchsize*(batch+1),nEntries), batch, args.coordinate)
           shell_file = 'graph_%s_%d.sh'%(data,batch)
           prepare_shell(shell_file, command, condor, FarmDir)
           fList.append(os.path.join(dataset_directory, data.replace('.hdf5','_graph_%d.pt'%batch)))
         else:
-          command += "python GraphCreator.py --particle %s --xml %s --dataset %s --from %d --to %d --tag %d\n"%(task["particle"], task["xml"], os.path.join(dataset_directory, data), batchsize*batch, min(batchsize*(batch+1),nEntries), batch)
+          command += "python GraphCreator.py --particle %s --xml %s --dataset %s --from %d --to %d --tag %d\n --coordinate %s"%(task["particle"], task["xml"], os.path.join(dataset_directory, data), batchsize*batch, min(batchsize*(batch+1),nEntries), batch, args.coordinate)
           shell_file = 'tensor_%s_%d.sh'%(data,batch)
           prepare_shell(shell_file, command, condor, FarmDir)
         fList.append(os.path.join(dataset_directory, data.replace('.hdf5','_tensor_%d.pt'%batch)))
