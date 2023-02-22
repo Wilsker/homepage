@@ -17,14 +17,22 @@ if __name__ == "__main__":
   parser.add_option('-t','--to', dest='To', help = 'End index', default = 5000, type = int)
   parser.add_option('-g','--tag', dest = 'tag', help = 'Store file tag', default = 0, type = int)
   parser.add_option('--store_geometric', dest = 'store_geometric', action = "store_true")
+  parser.add_option('--zero_pedding', dest = 'zero_pedding', action = "store_true")
 
   (args,opt) = parser.parse_args()
 
+  if args.store_geometric:
+    type_name = "graph"
+  else:
+    type_name = "tensor"
+  if args.zero_pedding:
+    pedding_name = 'zero_pedding'
+  else:
+    pedding_name = 'no_pedding'
+
   HLF_obj = HLF(args.particle, filename = args.binning_xml)
   data_file = h5py.File(args.dataset, 'r')
-  data = [HLF_obj.Get_Graphic(data_file["showers"][args.From:args.To],args.store_geometric), data_file["incident_energies"][args.From:args.To]]
-  if args.store_geometric:
-    torch.save(data, args.dataset.replace('.hdf5', '_graph_'+str(args.tag)+'.pt'))
-  else:
-    torch.save(data, args.dataset.replace('.hdf5', '_tensor_'+str(args.tag)+'.pt'))
+  data = [HLF_obj.Get_Graphic(data_file["showers"][args.From:args.To],args.store_geometric,not args.zero_pedding), data_file["incident_energies"][args.From:args.To]]
+
+  torch.save(data, args.dataset.replace('.hdf5', '_%s_%s_'%(type_name,pedding_name)+str(args.tag)+'.pt'))
 

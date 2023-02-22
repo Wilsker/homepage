@@ -248,7 +248,7 @@ class HighLevelFeatures:
         """ plots average of provided showers """
         self._DrawShower(data.mean(axis=0), filename=filename, title=title)
 
-    def Get_Graphic(self, data, coordinate='polar',save_torch_geometric = False):
+    def Get_Graphic(self, data, coordinate='polar',save_torch_geometric = False, mask_zero = False):
 
       process_data = data
       if coordinate == 'euclidian':
@@ -259,7 +259,10 @@ class HighLevelFeatures:
 
       Event = []
       nEvent = len(graph)
-      mask = (graph[:,:,0] != 0)
+      if mask_zero:
+        mask = (graph[:,:,0] != 0)
+      else:
+        mask = (graph[:,:,0] > -999)
       print(">>> Running Mask <<<")
       for i in range(len(graph)):
         Event.append((graph[i][mask[i]]).tolist())
@@ -269,6 +272,7 @@ class HighLevelFeatures:
 
       data = []
       print("")
+
       if save_torch_geometric:
         from torch_geometric.data import Data
         print(">>> Store Graph <<<")
@@ -285,12 +289,15 @@ class HighLevelFeatures:
           sys.stdout.flush()
       else:
         print(">>> Store tensor <<<")
-        for i, event in enumerate(Event):
-          x = torch.tensor(event,dtype=torch.float)
-          data.append(x)
-          sys.stdout.write('\r')
-          sys.stdout.write("Progress %d/%d" % ((i+1),nEvent))
-          sys.stdout.flush()
+        if mask_zero:
+          for i, event in enumerate(Event):
+            x = torch.tensor(event,dtype=torch.float)
+            data.append(x)
+            sys.stdout.write('\r')
+            sys.stdout.write("Progress %d/%d" % ((i+1),nEvent))
+            sys.stdout.flush()
+        else:
+          data = torch.tensor(Event) 
       print("")
       return data
 
