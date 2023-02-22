@@ -33,6 +33,14 @@ torch.cuda.get_arch_list()
 ```
 when run on a machine with GPU capability, should return a list that includes sm_80.
 
+Living list of required libraries:
+```
+torch
+functools
+numpy
+matplotlib
+```
+
 # Condor
 ## Running Jobs on Condor
 Note the condor scripts available in the condor_scripts directory allow one to submit jobs to run on CERNs lxplus farm remotely. By default, the job will get one slot of a CPU core with 2GB of memory and 20GB of disk space. You can ask for more CPUs and/or memory but the system will scale thje number of CPUs you receive to respect the 2GB per core limit.

@@ -1,4 +1,4 @@
-import time, functools, torch, os
+import time, functools, torch, os, random
 from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,9 +7,68 @@ import torch.nn.functional as F
 from torch.optim import Adam
 import torchvision.transforms as transforms
 from torch_geometric.loader import DataLoader
+from torch.utils.data import Dataset
+
+class custom_dataset(Dataset):
+    def __init__(self, data, condition, transform=None):
+        self.data = data
+        self.condition = torch.LongTensor(condition)
+        self.transform = transform
+    def __getitem__(self, index):
+        x = self.data[index]
+        y = self.condition[index]
+        return x,y
+    def __len__(self):
+        return len(self.data)
+
+class GaussianFourierProjection(nn.Module):
+    """Gaussian random features for encoding time steps"""
+    def __init__(self, embed_dim, scale=30):
+        super().__init__() # inherits from pytorch nn class
+        # Randomly sampled weights initialisation. Fixed during optimisation i.e. not trainable
+        self.W = nn.Parameter(torch.randn(embed_dim // 2) * scale, requires_grad=False)
+    def forward(self, x):
+        #print(f'x[:, None]: ' , x[:, None].shape)
+        #print(f'self.W[None, :]: ' , self.W[None,:].shape)
+        # Time information incorporated via Gaussian random feature encoding
+        x_proj = x[:, None] * self.W[None, :] * 2 * np.pi
+        #print('x_proj: ', x_proj.shape)
+        #print('Gauss projection returns: ', torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1).shape )
+        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+
+class Dense(nn.Module):
+    """Fully connected layer that reshapes outputs to feature maps"""
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.dense = nn.Linear(input_dim, output_dim)
+    def forward(self, x):
+        """Dense nn layer output must have same dimensions as input data:
+            For point clouds: [batchsize, (dummy)nhits, (dummy)features]
+        """
+        return self.dense(x)[..., None]
 
 class Block(nn.Module):
     def __init__(self, embed_dim, num_heads, hidden, dropout):
+        """Initialise an encoder block:
+        For 'class token' input (initially random):
+            - Attention layer
+            - Linear layer
+            - GeLU activation
+            - Linear layer
+        
+        For input:
+            - Add class token block output
+            - GeLU activation
+            - Dropout regularisation layer
+            - Linear layer
+            - Add to original input
+
+        Args:
+        embed_dim: length of embedding
+        num_heads: number of parallel attention heads to use
+        hidden: dimensionaliy of hidden layer
+        dropout: regularising layer
+        """
         super().__init__()
 
         # batch_first=True because normally in NLP the batch dimension would be the second dimension
@@ -25,26 +84,37 @@ class Block(nn.Module):
         self.hidden = hidden
 
     def forward(self,x,x_cls,src_key_padding_mask=None,):
+        # Stash original embedded input
         residual = x.clone()
+
+        # Multiheaded self-attention but replacing queries of all input examples with a single mean field approximator
         x_cls = self.attn(x_cls, x, x, key_padding_mask=src_key_padding_mask)[0]
         x_cls = self.act(self.fc1_cls(x_cls))
         x_cls = self.act_dropout(x_cls)
         x_cls = self.fc2(x_cls)
 
+        # Add mean field approximation to input embedding (acts like a bias)
         x = x + x_cls.clone()
         x = self.act(self.fc1(x))
         x = self.act_dropout(x)
         x = self.fc2(x)
+        
+        # Add to original input embedding
         x = x + residual
+        
         return x
-
 
 class Gen(nn.Module):
     def __init__(self,n_dim,l_dim_gen,hidden_gen,num_layers_gen,heads_gen,dropout_gen,**kwargs):
         super().__init__()
-        # Embedding layer increases dimensionality:
-        #   size of input (n_dim) features -> size of output (l_dim_gen)
-        self.embbed = nn.Linear(n_dim, l_dim_gen)
+
+        # Embedding: size of input (n_dim) features -> size of output (l_dim_gen)
+        self.embed = nn.Linear(n_dim, l_dim_gen)
+
+        # Seperate time embedding (small NN with fixed weights)
+        self.embed_t = nn.Sequential(GaussianFourierProjection(embed_dim=64), nn.Linear(64, 64))
+        self.dense1 = Dense(64, 1)
+
         # Module list of encoder blocks
         self.encoder = nn.ModuleList(
             [
@@ -59,17 +129,36 @@ class Gen(nn.Module):
         )
         self.dropout = nn.Dropout(dropout_gen)
         self.out = nn.Linear(l_dim_gen, n_dim)
+        # token simply has same dimension as input feature embedding
         self.cls_token = nn.Parameter(torch.zeros(1, 1, l_dim_gen), requires_grad=True)
         self.act = nn.GELU()
 
-    def forward(self,x,mask=None):
-        x = self.embbed(x)
+        # Swish activation function
+        self.act_sig = lambda x: x * torch.sigmoid(x)
+        self.marginal_prob_std = marginal_prob_std
+
+    def forward(self, x, t, e, mask=None):
+        # Embed poisitional input
+        x = self.embed(x)
+        
+        # Add time embedding
+        embed_t_ = self.act_sig( self.embed_t(t) )
+        # Now need to get dimensions right
+        x += self.dense1(embed_t_).clone()
+
+        # Add energy embedding
+        embed_e_ = self.act_sig( self.embed_t(e) )
+        # Now need to get dimensions right
+        x += self.dense1(embed_e_).clone()
+
         # 'class' token (mean field)
         x_cls = self.cls_token.expand(x.size(0), 1, -1)
         
-        # Encoder block
+        # Feed input embeddings into encoder block
         for layer in self.encoder:
+            # Each encoder block takes previous blocks output as input
             x = layer(x, x_cls=x_cls, src_key_padding_mask=mask)
+            # Should concatenate with the time embedding after each block?
 
         return self.out(x)
 
@@ -91,7 +180,7 @@ def marginal_prob_std(t, sigma):
     std = torch.sqrt((sigma**(2 * t) - 1.) / 2. / np.log(sigma)) 
     return std
 
-def loss_fn(model, x, marginal_prob_std , eps=1e-5):
+def loss_fn(model, x, injection_energy, marginal_prob_std , eps=1e-5):
     """The loss function for training score-based generative models
     Uses the weighted sum of Denoising Score matching objectives
     Denoising score matching
@@ -106,16 +195,83 @@ def loss_fn(model, x, marginal_prob_std , eps=1e-5):
         eps: A tolerance value for numerical stability
     """
     random_t = torch.rand(x.shape[0], device=x.device) * (1. - eps) + eps
+    injection_energy = torch.squeeze(injection_energy,-1)
     z = torch.randn_like(x)
     std = marginal_prob_std(random_t)
     perturbed_x = x + z * std[:, None, None]
-    model_output = model(perturbed_x)
+    model_output = model(perturbed_x, random_t, injection_energy)
     cloud_loss = torch.sum( (model_output*std + z)**2, dim=(1,2))
     return cloud_loss
+
+def  pc_sampler(score_model, marginal_prob_std, diffusion_coeff, sampled_energies, batch_size=1, snr=0.16, device='cuda', eps=1e-3):
+    ''' Generate samples from score based models with Predictor-Corrector method
+        Args:
+        score_model: A PyTorch model that represents the time-dependent score-based model.
+        marginal_prob_std: A function that gives the std of the perturbation kernel
+        diffusion_coeff: A function that gives the diffusion coefficient 
+        of the SDE.
+        batch_size: The number of samplers to generate by calling this function once.
+        num_steps: The number of sampling steps. 
+        Equivalent to the number of discretized time steps.    
+        device: 'cuda' for running on GPUs, and 'cpu' for running on CPUs.
+        eps: The smallest time step for numerical stability.
+
+        Returns:
+            samples
+    '''
+    num_steps=500
+    t = torch.ones(batch_size, device=device)
+    # Currently setting to some number of hits
+    gen_n_hits = 289
+    init_x = torch.randn(batch_size, gen_n_hits, 4, device=device) * marginal_prob_std(t)[:,None,None]
+    time_steps = np.linspace(1., eps, num_steps)
+    step_size = time_steps[0]-time_steps[1]
+    x = init_x
+    with torch.no_grad():
+         for time_step in time_steps:
+            print(f"Sampler step: {time_step:.4f}")
+            batch_time_step = torch.ones(batch_size,device=device) * time_step
+            
+            # Sneaky bug fix (matrix multiplication in GaussianFourier projection doesnt like float64s)
+            sampled_energies = sampled_energies.to(torch.float32)
+            #sampled_energies.to(device)
+            
+            # Corrector step (Langevin MCMC)
+            # First calculate Langevin step size
+            grad = score_model(x, batch_time_step, sampled_energies)
+            #grad = score_model(x, batch_time_step)
+            grad_norm = torch.norm( grad.reshape(grad.shape[0], -1), dim=-1 ).mean()
+            noise_norm = np.sqrt(np.prod(x.shape[1:]))
+            langevin_step_size = 2 * (snr * noise_norm / grad_norm)**2
+            
+            # Implement iteration rule
+            x = x + langevin_step_size * grad + torch.sqrt(2 * langevin_step_size) * torch.randn_like(x)
+
+            # Euler-Maruyama predictor step
+            g = diffusion_coeff(batch_time_step)
+            x_mean = x + (g**2)[:, None, None] * score_model(x, batch_time_step, sampled_energies) * step_size
+            #x_mean = x + (g**2)[:, None, None] * score_model(x, batch_time_step) * step_size
+            x = x_mean + torch.sqrt(g**2 * step_size)[:, None, None] * torch.randn_like(x)
+
+    # Do not include noise in last step
+    return x_mean
+
+def diffusion_coeff(t, sigma=25.0):
+    """Compute the diffusion coefficient of our SDE
+    Args:
+        t: A vector of time steps
+        sigma: from the SDE
+    Returns:
+    Vector of diffusion coefficients
+    """
+    return torch.tensor(sigma**t, device=device)
 
 def main():
     # For debugging gradient issues
     #torch.autograd.set_detect_anomaly(True)
+
+    training_switch = 1
+    testing_switch = 0
 
     print('torch version: ', torch.__version__)
     global device
@@ -128,94 +284,116 @@ def main():
 
     sigma = 25.0
     marginal_prob_std_fn = functools.partial(marginal_prob_std, sigma=sigma)
-    
+    diffusion_coeff_fn = functools.partial(diffusion_coeff, sigma=sigma)
+
     filename = '/eos/user/t/tihsu/SWAN_projects/homepage/datasets/dataset_1_photons_1_graph.pt'
     loaded_file = torch.load(filename)
     point_clouds = loaded_file[0]
     print(f'Loading {len(point_clouds)} point clouds from file {filename}')
     energies = loaded_file[1]
+    custom_data = custom_dataset(point_clouds, energies,)
     load_n_clouds = 1
     lr = 1e-4
     n_epochs = 20
-    av_losses_per_epoch = []
-
-    output_directory = '/afs/cern.ch/work/j/jthomasw/private/NTU/fast_sim/calochall_homepage/scoremodel/training_'+datetime.now().strftime('%Y%m%d_%H%M')+'_output/'
-    if not os.path.exists(output_directory):
-        os.makedirs(output_directory)
-
     
-    # Size of the last dimension of the input must match the input to the embedding layer
-    # First arg = number of features
-    model=Gen(4,20,128,3,1,0)
-    #for para_ in model.parameters():
-    #    print('model parameters: ', para_)
+    if training_switch:
+        av_losses_per_epoch = []
+        output_directory = '/afs/cern.ch/work/j/jthomasw/private/NTU/fast_sim/calochall_homepage/scoremodel/training_'+datetime.now().strftime('%Y%m%d_%H%M')+'_output/'
+        if not os.path.exists(output_directory):
+            os.makedirs(output_directory)
 
-    optimiser = Adam(model.parameters(),lr=lr)
-    cumulative_epoch_loss = 0.
-    cumulative_num_clouds = 0
-    # Load clouds for each epoch of data
-    point_clouds_loader = DataLoader(point_clouds,batch_size=load_n_clouds,shuffle=False)
-    #cloud_iter_ = iter(point_clouds_loader)
-    batch_size = 50
-    for epoch in range(0,n_epochs):
-        print(f"epoch: {epoch}")
-        cloud_batch_losses = []
+        # Size of the last dimension of the input must match the input to the embedding layer
+        # First arg = number of features
+        model=Gen(4,20,128,3,1,0)
+        #for para_ in model.parameters():
+        #    print('model parameters: ', para_)
+
+        # Optimiser needs to know model parameters for to optimise
+        optimiser = Adam(model.parameters(),lr=lr)
         
-        # Load clouds one at a time
-        #for i in range(0, len(point_clouds), load_n_clouds):
-        #for i in range(0, n_clouds_in_batch, load_n_clouds):
-        for i, cloud_data in enumerate(point_clouds_loader,0):
-            if i%100 == 0: print(f"Batch: {i}")
-            #print(f"Batch: {i}")
+        batch_size = 500
+        for epoch in range(0,n_epochs):
+            # Load clouds for each epoch of data dataloaders length will be the number of batches
+            #point_clouds_loader = DataLoader(point_clouds,batch_size=load_n_clouds,shuffle=True)
+            #energies_loader = DataLoader(energies,batch_size=load_n_clouds,shuffle=True)
+            point_clouds_loader = DataLoader(custom_data,batch_size=load_n_clouds,shuffle=True)
+            print(f"epoch: {epoch}")
+            cumulative_epoch_loss = 0.
+            cloud_batch_losses = []
+            cloud_counter = 0
+            batch_counter = 0
+            # Load a cloud
+            for i, (cloud_data,injection_energy) in enumerate(point_clouds_loader,0):
+                #if batch_counter>5:
+                #    print(f'Done 5 batches, move to next epoch')
+                #    break
+                if i%100 == 0: print(f"Cloud: {i}")
+                cloud_counter+=1
+                
+                if len(cloud_data.x) < 1:
+                    print('Very few points in cloud: ', cloud_data.x)
+                    continue
+                # Adds batch dimension to front of data (currently making batches of 1 cloud manually)
+                input_data = torch.unsqueeze(cloud_data.x, 0)
+
+                # Calculate loss for for individual clouds
+                cloud_loss = loss_fn(model, input_data, injection_energy, marginal_prob_std_fn)
+                
+                # Collect losses of clouds in batch
+                cloud_batch_losses.append( cloud_loss )
+                
+                # If # clouds reaches batch_size
+                if i%batch_size == 0 and i>0:
+                    batch_counter+=1
+                    print(f'Batch: {batch_counter} (cloud: {i})')
+                    # Average cloud loss in batch to backpropagate (could also use sum)
+                    cloud_batch_loss_average = sum(cloud_batch_losses)/len(cloud_batch_losses)
+                    print(f'Batch loss average: ', cloud_batch_loss_average.item())
+                    # Zero any gradients from previous steps
+                    optimiser.zero_grad()
+                    # collect dL/dx for any parameters (x) which have requires_grad = True via: x.grad += dL/dx
+                    cloud_batch_loss_average.backward(retain_graph=True)
+                    # add the batch mean loss * size of batch to cumulative loss
+                    cumulative_epoch_loss+=cloud_batch_loss_average.item()*batch_size
+                    # Update value of x += -lr * x.grad
+                    optimiser.step()
+                    # Ensure batch losses list is cleared
+                    cloud_batch_losses.clear()
             
-            #cloud_data = next(cloud_iter_)
-            if len(cloud_data.x) < 1:
-                print('Very few points in cloud: ', cloud_data.x)
-                continue
-            input_data = torch.unsqueeze(cloud_data.x, 0)
-            cloud_loss = loss_fn(model, input_data, marginal_prob_std_fn)
-            print(f'cloud_loss: {cloud_loss} \n {cloud_loss.item()}')
-            
-            # collect losses of each cloud in batch
-            cloud_batch_losses.append( cloud_loss )
-            #cloud_batch_loss += cloud_loss
-            if i%batch_size == 0 and i>0:
-                print(f'cloud_batch_losses: {cloud_batch_losses}')
-                cloud_batch_loss = sum(cloud_batch_losses)
-                optimiser.zero_grad()
-                cloud_batch_loss.backward(retain_graph=True)
-                optimiser.step()
-                cloud_batch_losses.clear()
-            
-            # Zero any gradients from previous steps
-            #optimiser.zero_grad()
+            # Add the batch size just used to the total number of clouds
+            av_losses_per_epoch.append(cumulative_epoch_loss/cloud_counter)
+            # Save checkpoint file after each epoch
+            torch.save(model.state_dict(), output_directory+'ckpt_tmp_'+str(epoch)+'.pth')
+            print(f'End-of-epoch: average loss = {av_losses_per_epoch}')
 
-            # collect dL/dx for any parameters (x) which have requires_grad = True via: x.grad += dL/dx
-            #cloud_loss.backward(retain_graph=True)
-
-            # Update value of x += -lr * x.grad
-            #optimiser.step()
-
-            # add the batch mean loss * size of batch to cumulative loss
-            #cumulative_epoch_loss+=cloud_loss.item()*load_n_clouds
-
-            # add the batch size just used to the total number of clouds
-            #cumulative_num_clouds = i
-
-        
-        #av_losses_per_epoch.append(cumulative_epoch_loss/cumulative_num_clouds)
-        #print(f'Average Loss for the epoch: {(cumulative_epoch_loss/cumulative_num_clouds):.3f}')
-        # Save checkpoint file after each epoch
-        torch.save(model.state_dict(), output_directory+'ckpt_tmp.pth')
-
-    fig, ax = plt.subplots(ncols=1, figsize=(10,10))
-    plt.title('')
-    plt.ylabel('Loss')
-    plt.xlabel('Epoch')
-    plt.legend(loc='upper right')
-    plt.plot(av_losses_per_epoch, label='training')
-    plt.tight_layout()
-    fig.savefig(output_directory+'loss_v_epoch.png')
+        print('plotting : ', av_losses_per_epoch)
+        fig, ax = plt.subplots(ncols=1, figsize=(10,10))
+        plt.title('')
+        plt.ylabel('Loss')
+        plt.xlabel('Epoch')
+        plt.legend(loc='upper right')
+        plt.plot(av_losses_per_epoch, label='training')
+        plt.tight_layout()
+        fig.savefig(output_directory+'loss_v_epoch.png')
+    
+    if testing_switch:
+        output_directory = '/afs/cern.ch/work/j/jthomasw/private/NTU/fast_sim/calochall_homepage/scoremodel/sampling_'+datetime.now().strftime('%Y%m%d_%H%M')+'_output/'
+        if not os.path.exists(output_directory):
+            os.makedirs(output_directory)
+        sample_batch_size = 100
+        model=Gen(4,20,128,3,1,0)
+        #load_name = 'training_20230221_0926_output/ckpt_tmp_29.pth'
+        load_name = 'training_20230222_0933_output/ckpt_tmp_4.pth'
+        model.load_state_dict(torch.load(load_name, map_location=device))
+        sampled_energies = sorted(energies[:])
+        sampled_energies = random.sample(sampled_energies, sample_batch_size)
+        sampled_energies = torch.tensor(sampled_energies) # Converting tensor from list of ndarrays is very slow (should convert to single ndarray first)
+        sampled_energies = torch.squeeze(sampled_energies)
+        print('sampled_energies: ', sampled_energies)
+        sampler = pc_sampler
+        # Get a sample of point clouds
+        samples = sampler(model, marginal_prob_std_fn, diffusion_coeff_fn, sampled_energies, sample_batch_size, device=device)
+        print('Samples: ', samples.shape)
 
 
 if __name__=='__main__':
