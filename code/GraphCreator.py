@@ -35,5 +35,5 @@ if __name__ == "__main__":
   data_file = h5py.File(args.dataset, 'r')
   data = [HLF_obj.Get_Graphic(data_file["showers"][args.From:args.To],args.coordinate,args.store_geometric,not args.zero_pedding), data_file["incident_energies"][args.From:args.To]]
 
-  torch.save(data, args.dataset.replace('.hdf5', '_%s_%s_%s'%(type_name,pedding_name,args.coordinate)+str(args.tag)+'.pt'))
+  torch.save(data, args.dataset.replace('.hdf5', '_%s_%s_%s_'%(type_name,pedding_name,args.coordinate)+str(args.tag)+'.pt'))
 

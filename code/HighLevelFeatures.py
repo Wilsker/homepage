@@ -252,7 +252,7 @@ class HighLevelFeatures:
 
       process_data = data
       if coordinate == 'euclidian':
-        map_list = [self.euclidian for i in range(len(process_data))]
+        map_list = [self.euclidian_list for i in range(len(process_data))]
       else:
         map_list = [self.polar_list for i in range(len(process_data))]
       graph = np.concatenate((np.reshape(process_data,(np.shape(process_data)[0],np.shape(process_data)[1],1)),map_list),axis=2)
