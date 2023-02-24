@@ -1,4 +1,5 @@
-import time, functools, torch, os, random
+import time, functools, torch, os, random, utils
+from CloudFeatures import CloudFeatures
 from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,18 +10,6 @@ import torchvision.transforms as transforms
 from torch_geometric.loader import DataLoader
 from torch.utils.data import Dataset
 
-class custom_dataset(Dataset):
-    def __init__(self, data, condition, transform=None):
-        self.data = data
-        self.condition = torch.LongTensor(condition)
-        self.transform = transform
-    def __getitem__(self, index):
-        x = self.data[index]
-        y = self.condition[index]
-        return x,y
-    def __len__(self):
-        return len(self.data)
-
 class GaussianFourierProjection(nn.Module):
     """Gaussian random features for encoding time steps"""
     def __init__(self, embed_dim, scale=30):
@@ -28,12 +17,8 @@ class GaussianFourierProjection(nn.Module):
         # Randomly sampled weights initialisation. Fixed during optimisation i.e. not trainable
         self.W = nn.Parameter(torch.randn(embed_dim // 2) * scale, requires_grad=False)
     def forward(self, x):
-        #print(f'x[:, None]: ' , x[:, None].shape)
-        #print(f'self.W[None, :]: ' , self.W[None,:].shape)
         # Time information incorporated via Gaussian random feature encoding
         x_proj = x[:, None] * self.W[None, :] * 2 * np.pi
-        #print('x_proj: ', x_proj.shape)
-        #print('Gauss projection returns: ', torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1).shape )
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
 class Dense(nn.Module):
@@ -70,7 +55,6 @@ class Block(nn.Module):
         dropout: regularising layer
         """
         super().__init__()
-
         # batch_first=True because normally in NLP the batch dimension would be the second dimension
         # In everything(?) else it is the first dimension so this flag is set to true to match other conventions
         self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=0)
@@ -105,7 +89,7 @@ class Block(nn.Module):
         return x
 
 class Gen(nn.Module):
-    def __init__(self,n_dim,l_dim_gen,hidden_gen,num_layers_gen,heads_gen,dropout_gen,**kwargs):
+    def __init__(self, n_dim, l_dim_gen, hidden_gen, num_layers_gen, heads_gen, dropout_gen, marginal_prob_std, **kwargs):
         super().__init__()
 
         # Embedding: size of input (n_dim) features -> size of output (l_dim_gen)
@@ -160,7 +144,7 @@ class Gen(nn.Module):
             x = layer(x, x_cls=x_cls, src_key_padding_mask=mask)
             # Should concatenate with the time embedding after each block?
 
-        return self.out(x)
+        return self.out(x) / self.marginal_prob_std(t)[:, None, None]
 
 """Set up the SDE"""
 def marginal_prob_std(t, sigma):
@@ -176,7 +160,7 @@ def marginal_prob_std(t, sigma):
     Returns:
         The standard deviation.
     """    
-    t = t.clone().detach() #torch.tensor(t, device=device)
+    t = t.clone().detach()
     std = torch.sqrt((sigma**(2 * t) - 1.) / 2. / np.log(sigma)) 
     return std
 
@@ -234,12 +218,10 @@ def  pc_sampler(score_model, marginal_prob_std, diffusion_coeff, sampled_energie
             
             # Sneaky bug fix (matrix multiplication in GaussianFourier projection doesnt like float64s)
             sampled_energies = sampled_energies.to(torch.float32)
-            #sampled_energies.to(device)
             
             # Corrector step (Langevin MCMC)
             # First calculate Langevin step size
             grad = score_model(x, batch_time_step, sampled_energies)
-            #grad = score_model(x, batch_time_step)
             grad_norm = torch.norm( grad.reshape(grad.shape[0], -1), dim=-1 ).mean()
             noise_norm = np.sqrt(np.prod(x.shape[1:]))
             langevin_step_size = 2 * (snr * noise_norm / grad_norm)**2
@@ -250,7 +232,6 @@ def  pc_sampler(score_model, marginal_prob_std, diffusion_coeff, sampled_energie
             # Euler-Maruyama predictor step
             g = diffusion_coeff(batch_time_step)
             x_mean = x + (g**2)[:, None, None] * score_model(x, batch_time_step, sampled_energies) * step_size
-            #x_mean = x + (g**2)[:, None, None] * score_model(x, batch_time_step) * step_size
             x = x_mean + torch.sqrt(g**2 * step_size)[:, None, None] * torch.randn_like(x)
 
     # Do not include noise in last step
@@ -270,8 +251,8 @@ def main():
     # For debugging gradient issues
     #torch.autograd.set_detect_anomaly(True)
 
-    training_switch = 1
-    testing_switch = 0
+    training_switch = 0
+    testing_switch = 1
 
     print('torch version: ', torch.__version__)
     global device
@@ -287,15 +268,16 @@ def main():
     diffusion_coeff_fn = functools.partial(diffusion_coeff, sigma=sigma)
 
     filename = '/eos/user/t/tihsu/SWAN_projects/homepage/datasets/dataset_1_photons_1_graph.pt'
+    #filename = '/eos/user/t/tihsu/SWAN_projects/homepage/datasets/dataset_1_photons_2_graph.pt'
     loaded_file = torch.load(filename)
     point_clouds = loaded_file[0]
     print(f'Loading {len(point_clouds)} point clouds from file {filename}')
     energies = loaded_file[1]
-    custom_data = custom_dataset(point_clouds, energies,)
+    custom_data = utils.cloud_dataset(point_clouds, energies,)
     load_n_clouds = 1
     lr = 1e-4
-    n_epochs = 20
-    
+    n_epochs = 30
+
     if training_switch:
         av_losses_per_epoch = []
         output_directory = '/afs/cern.ch/work/j/jthomasw/private/NTU/fast_sim/calochall_homepage/scoremodel/training_'+datetime.now().strftime('%Y%m%d_%H%M')+'_output/'
@@ -304,14 +286,14 @@ def main():
 
         # Size of the last dimension of the input must match the input to the embedding layer
         # First arg = number of features
-        model=Gen(4,20,128,3,1,0)
+        model=Gen(4, 20, 128, 3, 1, 0, marginal_prob_std=marginal_prob_std_fn)
         #for para_ in model.parameters():
         #    print('model parameters: ', para_)
 
         # Optimiser needs to know model parameters for to optimise
         optimiser = Adam(model.parameters(),lr=lr)
         
-        batch_size = 500
+        batch_size = 200
         for epoch in range(0,n_epochs):
             # Load clouds for each epoch of data dataloaders length will be the number of batches
             #point_clouds_loader = DataLoader(point_clouds,batch_size=load_n_clouds,shuffle=True)
@@ -371,8 +353,9 @@ def main():
         plt.title('')
         plt.ylabel('Loss')
         plt.xlabel('Epoch')
-        plt.legend(loc='upper right')
+        plt.yscale('log')
         plt.plot(av_losses_per_epoch, label='training')
+        plt.legend(loc='upper right')
         plt.tight_layout()
         fig.savefig(output_directory+'loss_v_epoch.png')
     
@@ -380,10 +363,57 @@ def main():
         output_directory = '/afs/cern.ch/work/j/jthomasw/private/NTU/fast_sim/calochall_homepage/scoremodel/sampling_'+datetime.now().strftime('%Y%m%d_%H%M')+'_output/'
         if not os.path.exists(output_directory):
             os.makedirs(output_directory)
+        
+        # Make a simple plot of the total energy deposited by a shower in a given z layer
+        point_clouds_loader = DataLoader(custom_data,batch_size=load_n_clouds,shuffle=False)
+        cloud_features = CloudFeatures(point_clouds_loader)
+        energy_means = cloud_features.calculate_mean_energies()
+        hits_means = cloud_features.calculate_mean_nhits()
+        total_e_ = cloud_features.all_energies
+        total_hits_ = cloud_features.all_hits
+
+        #print('hits_means: ', hits_means)
+        #print('energy_means: ', energy_means)
+        #print('total_e_: ', total_e_)
+        #print('total_hits_: ', total_hits_)
+        
+        fig, ax = plt.subplots(ncols=1, figsize=(10,10))
+        plt.title('')
+        plt.ylabel('Average deposited energy [GeV]')
+        plt.xlabel('Layer number')
+        plt.plot(energy_means, label='Geant4')
+        plt.legend(loc='upper right')
+        fig.savefig(output_directory+'avE_per_layer.png')
+
+        fig, ax = plt.subplots(ncols=1, figsize=(10,10))
+        plt.title('')
+        plt.ylabel('Average nhits [GeV]')
+        plt.xlabel('Layer number')
+        plt.plot(hits_means, label='Geant4')
+        plt.legend(loc='upper right')
+        fig.savefig(output_directory+'avHits_per_layer.png')
+
+        fig, ax = plt.subplots(ncols=1, figsize=(10,10))
+        plt.title('')
+        plt.ylabel('Entries')
+        plt.xlabel('Deposited energy [GeV] (per shower)')
+        plt.hist(total_e_, 20,label='Geant4')
+        plt.legend(loc='upper right')
+        fig.savefig(output_directory+'deposited_energy_per_cloud.png')
+
+        fig, ax = plt.subplots(ncols=1, figsize=(10,10))
+        plt.title('')
+        plt.ylabel('Entries')
+        plt.xlabel('# hits (per shower)')
+        plt.hist(total_hits_, 20, label='Geant4')
+        plt.legend(loc='upper right')
+        fig.savefig(output_directory+'nhits_per_cloud.png')
+            
+
+        
         sample_batch_size = 100
         model=Gen(4,20,128,3,1,0)
-        #load_name = 'training_20230221_0926_output/ckpt_tmp_29.pth'
-        load_name = 'training_20230222_0933_output/ckpt_tmp_4.pth'
+        load_name = 'training_20230223_1538_output/ckpt_tmp_29.pth'
         model.load_state_dict(torch.load(load_name, map_location=device))
         sampled_energies = sorted(energies[:])
         sampled_energies = random.sample(sampled_energies, sample_batch_size)
@@ -394,6 +424,7 @@ def main():
         # Get a sample of point clouds
         samples = sampler(model, marginal_prob_std_fn, diffusion_coeff_fn, sampled_energies, sample_batch_size, device=device)
         print('Samples: ', samples.shape)
+
 
 
 if __name__=='__main__':
