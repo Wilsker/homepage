@@ -3,12 +3,15 @@
     Class that handles the specific binning geometry based on the provided file
     and computes all relevant high-level features
 """
-import os
+import os,sys
 import math
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm as LN
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+import torch
+from itertools import combinations, permutations
+import awkward as ak
 
 
 from XMLHandler import XMLHandler
@@ -30,6 +33,7 @@ class HighLevelFeatures:
         self.r_edges = [redge for redge in xml.r_edges if len(redge) > 1]
         self.num_alpha = [len(xml.alphaListPerLayer[idx][0]) for idx, redge in \
                           enumerate(xml.r_edges) if len(redge) > 1]
+        self.mid_alpha = xml.alphaListPerLayer
         self.E_tot = None
         self.E_layers = {}
         self.EC_etas = {}
@@ -41,6 +45,31 @@ class HighLevelFeatures:
         self.num_voxel = []
         for idx, r_values in enumerate(self.r_edges):
             self.num_voxel.append((len(r_values)-1)*self.num_alpha[idx])
+
+        self.polar_list = []
+        self.euclidian_list = []
+        self.create_geometry_mapping()
+
+    def get_midpoint(self, arr):
+        middle_points = []
+        for i in range(len(arr)-1):
+            middle_value = arr[i] + float((arr[i+1] - arr[i]))/2
+            middle_points.append(middle_value)
+        return middle_points
+
+    def create_geometry_mapping(self):
+      polar_list = []
+      euclidian_list = []
+      for layer_no, layer in enumerate(self.relevantLayers):
+        for alpha in (self.get_midpoint(np.linspace(-math.pi, math.pi, self.num_alpha[layer_no]+1))):
+          for r in self.get_midpoint(self.r_edges[layer_no]):
+            polar_list.append([r,alpha,layer])
+            
+        for idx in range(len(self.eta_all_layers[layer])):
+            euclidian_list.append([self.eta_all_layers[layer][idx],self.phi_all_layers[layer][idx],layer])
+      self.polar_list = polar_list
+      self.euclidian_list = euclidian_list
+            
 
     def _calculate_EC(self, eta, phi, energy):
         eta_EC = (eta * energy).sum(axis=-1)/(energy.sum(axis=-1)+1e-16)
@@ -218,6 +247,60 @@ class HighLevelFeatures:
     def DrawAverageShower(self, data, filename=None, title=None):
         """ plots average of provided showers """
         self._DrawShower(data.mean(axis=0), filename=filename, title=title)
+
+    def Get_Graphic(self, data, coordinate='polar',save_torch_geometric = False, mask_zero = False):
+
+      process_data = data
+      if coordinate == 'euclidian':
+        map_list = [self.euclidian_list for i in range(len(process_data))]
+      else:
+        map_list = [self.polar_list for i in range(len(process_data))]
+      graph = np.concatenate((np.reshape(process_data,(np.shape(process_data)[0],np.shape(process_data)[1],1)),map_list),axis=2)
+
+      Event = []
+      nEvent = len(graph)
+      if mask_zero:
+        mask = (graph[:,:,0] != 0)
+      else:
+        mask = (graph[:,:,0] > -999)
+      print(">>> Running Mask <<<")
+      for i in range(len(graph)):
+        Event.append((graph[i][mask[i]]).tolist())
+        sys.stdout.write('\r')
+        sys.stdout.write("Progress: %d/%d" % ((i+1),nEvent))
+        sys.stdout.flush()
+
+      data = []
+      print("")
+
+      if save_torch_geometric:
+        from torch_geometric.data import Data
+        print(">>> Store Graph <<<")
+        for i, event in enumerate(Event):
+          x = torch.tensor(event,dtype=torch.float)
+          edge_index = []
+          for comb_ in list(combinations(range(len(event)), 2 )):
+            edge_index.append([comb_[0],comb_[1]])
+            edge_index.append([comb_[1],comb_[0]])
+          edge_index = torch.tensor(edge_index,dtype=torch.long)
+          data.append(Data(x=x))
+          sys.stdout.write('\r')
+          sys.stdout.write("Progress %d/%d" % ((i+1),nEvent))
+          sys.stdout.flush()
+      else:
+        print(">>> Store tensor <<<")
+        if mask_zero:
+          for i, event in enumerate(Event):
+            x = torch.tensor(event,dtype=torch.float)
+            data.append(x)
+            sys.stdout.write('\r')
+            sys.stdout.write("Progress %d/%d" % ((i+1),nEvent))
+            sys.stdout.flush()
+        else:
+          data = torch.tensor(Event) 
+      print("")
+      return data
+
 
     def DrawSingleShower(self, data, filename=None, title=None):
         """ plots all provided showers after each other """
